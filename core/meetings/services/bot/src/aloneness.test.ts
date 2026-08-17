@@ -2,10 +2,14 @@
 import {
   DEFAULT_ALONE_SILENCE_WINDOW_MS,
   DEFAULT_ALONE_UNAVAILABLE_GRACE_MS,
+  DEFAULT_STREAM_PRESENCE_STALENESS_MS,
+  createDeafCaptureGuardAdapter,
   createRemoteAudioActivityTap,
   createSilenceAlonenessSource,
+  deafCaptureGuardAdapter,
   resolveAloneSilenceWindowMs,
   resolveAloneUnavailableGraceMs,
+  silenceAlonenessAdapter,
 } from './aloneness.js';
 
 let failed = 0;
@@ -36,21 +40,27 @@ class FakeScheduler {
 const loudEnergy = 0.02;
 const quietEnergy = 0.001;
 
-function fixture(windowMs = 1_000, unavailableGraceMs = 500) {
+function fixture(windowMs = 1_000, unavailableGraceMs = 500, extra: {
+  adapters?: Parameters<typeof createSilenceAlonenessSource>[0]['adapters'];
+  onCaptureFault?: () => void;
+} = {}) {
   const clock = new FakeClock();
   const scheduler = new FakeScheduler();
   const activity = createRemoteAudioActivityTap({ now: clock.now });
+  const logs: string[] = [];
   const source = createSilenceAlonenessSource({
     activity,
     windowMs,
     unavailableGraceMs,
+    adapters: extra.adapters,
+    onCaptureFault: extra.onCaptureFault,
     now: clock.now,
     pollMs: 10,
     setInterval: scheduler.setInterval,
     clearInterval: scheduler.clearInterval,
-    log: () => { /* deterministic fixture: logs asserted by live evidence */ },
+    log: (m) => { logs.push(m); },
   });
-  return { clock, scheduler, activity, source };
+  return { clock, scheduler, activity, source, logs };
 }
 
 // silence(W) fires once from the capture-ready anchor.
@@ -214,6 +224,215 @@ function fixture(windowMs = 1_000, unavailableGraceMs = 500) {
   source.onAlone(() => fired++);
   clock.advance(10_000); scheduler.tick();
   check('a future adapter can veto the silence verdict', fired === 0);
+}
+
+// ── #1192 deaf-leave guard: connected streams delivering nothing are a BROKEN CAPTURE, not an
+// empty room. Frame arrival is the silence adapter's only oracle, so a capture chain that dies
+// mid-meeting looks exactly like everybody leaving — and the bot walks out of a live meeting with
+// a `completed(left_alone)` on the board. The page-side stream count is the bit that separates the
+// two cases; these timelines pin every branch of how it is read.
+
+// (a) The defect itself: capture ready, two streams connected, not one frame for the whole window.
+{
+  const f = fixture();
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_000); f.scheduler.tick(); f.scheduler.tick();
+  check('connected streams + zero frames does not fire left_alone', fired === 0);
+  check('capture-fault is surfaced loudly',
+    f.logs.some((m) => m.includes('capture-fault suspected') && m.includes('streams=2')),
+    JSON.stringify(f.logs));
+  check('the guard keeps polling instead of terminating', f.scheduler.activeCount === 1);
+  // ...and it stays held while the fault persists, rather than expiring into a leave.
+  f.clock.advance(10_000); f.scheduler.tick();
+  check('a persisting capture-fault never converts into left_alone', fired === 0);
+}
+
+// (b) No connected streams: the room really did empty — today's verdict, unchanged.
+{
+  const f = fixture();
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(0);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_000); f.scheduler.tick();
+  check('zero connected streams still resolves alone', fired === 1);
+}
+
+// (c) Frames flowed and then stopped dead while the streams stayed connected — the #850 class as it
+// actually appears in prod (capture works, then it does not).
+{
+  const f = fixture();
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(400); f.activity.observeRemoteEnergy(loudEnergy); f.scheduler.tick();
+  f.clock.advance(400); f.activity.observeRemoteEnergy(loudEnergy); f.scheduler.tick();
+  f.activity.observeStreamPresence(2);      // the page keeps reporting: they are still here
+  f.clock.advance(1_000); f.scheduler.tick();
+  check('frames stopping mid-meeting with streams connected does not fire', fired === 0);
+}
+
+// (d) Presence never reported (the gmeet lane: per-channel capture, no mix, no `__vexaMixSeen`) —
+// unknown must mean "behave exactly as before", never "assume zero".
+{
+  const f = fixture();
+  let fired = 0;
+  f.activity.ready();
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_000); f.scheduler.tick();
+  check('unknown stream presence leaves the silence verdict untouched', fired === 1);
+}
+
+// (e) True silence with the capture chain alive: frames keep ARRIVING, they just carry no energy.
+// The bot can hear; the room is quiet; leaving is correct.
+{
+  const f = fixture();
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  for (let i = 0; i < 4; i++) {
+    f.clock.advance(250);
+    f.activity.observeRemoteEnergy(0);     // delivered, silent — capture is alive
+    f.activity.observeStreamPresence(2);
+    f.scheduler.tick();
+  }
+  check('zero-energy frames still arriving resolve alone (silent room, not deaf bot)', fired === 1);
+}
+
+// (f) A capture-fault that heals: once frames arrive again the guard stops objecting, and the
+// meeting is back under the ordinary silence rule — up to and including leaving when the room
+// really does empty afterwards.
+{
+  const f = fixture(1_000, 500, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 500 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(900); f.activity.observeStreamPresence(2);
+  f.clock.advance(100); f.scheduler.tick();
+  check('fault held the verdict', fired === 0);
+  f.activity.observeRemoteEnergy(loudEnergy);   // capture recovers
+  f.activity.observeStreamPresence(2);
+  f.clock.advance(999); f.activity.observeStreamPresence(2); f.scheduler.tick();
+  check('recovered capture is not fired on early', fired === 0);
+  f.clock.advance(1); f.activity.observeStreamPresence(0);   // and then everyone leaves
+  f.clock.advance(501); f.scheduler.tick();                  // past the sticky-presence window
+  check('a healed capture returns to the plain silence verdict', fired === 1);
+}
+
+// (g) The single repair attempt: one restart per subscription, never a restart loop.
+{
+  let restarts = 0;
+  const f = fixture(1_000, 500, { onCaptureFault: () => { restarts++; } });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_000); f.scheduler.tick();
+  f.clock.advance(5_000); f.scheduler.tick(); f.scheduler.tick();
+  check('capture restart is attempted exactly once', restarts === 1);
+  check('the restart attempt does not release left_alone', fired === 0);
+}
+
+// (h) Stale presence: the page stopped reporting (its rescan died). A stale bit must not be able to
+// hold a bot open forever — presence ages back to unknown and the silence rule takes over.
+{
+  const f = fixture(1_000, 500, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 2_000 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_500); f.scheduler.tick();
+  check('a fresh presence report holds the verdict', fired === 0);
+  f.clock.advance(1_000); f.scheduler.tick();   // 2.5s since the last report > 2s staleness
+  check('stale presence falls back to the pre-guard behaviour', fired === 1);
+}
+
+// (i) DTX flap: a remote track mutes between talk spurts, so a rescan can sample zero while the
+// participants are plainly still there. Presence is sticky over the staleness window for exactly
+// this reason — one unlucky sample must not evict the bot.
+{
+  const f = fixture(1_000, 500, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 5_000 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(900); f.activity.observeStreamPresence(0);   // the flap
+  f.clock.advance(100); f.scheduler.tick();
+  check('a momentary zero inside the staleness window does not evict', fired === 0);
+}
+
+// (j) #1174 preserved with the guard live: an ever-ready capture that goes unavailable still
+// converges after the grace, connected streams or not — that branch is decided before any adapter.
+{
+  const f = fixture(1_000, 500);
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(2);
+  f.source.onAlone(() => fired++);
+  f.activity.unavailable();
+  f.clock.advance(499); f.scheduler.tick();
+  check('unavailable within grace does not fire (streams present)', fired === 0);
+  f.clock.advance(501); f.scheduler.tick();
+  check('unavailable past grace still converges with streams present', fired === 1);
+}
+
+// The guard as a unit: it abstains ('alone' = no objection) on every branch it cannot decide, and
+// only ever objects with capture-fault. Composed with the silence adapter, abstention is what makes
+// every pre-existing timeline read byte-for-byte as before.
+{
+  const guard = createDeafCaptureGuardAdapter({ stalenessMs: 1_000 });
+  const base = { available: true, lastRemoteAudioAt: 0, streamsConnected: 2, streamsObservedAt: 10_000, streamsPresentAt: 10_000 };
+  check('guard abstains when capture is unavailable',
+    guard.evaluate({ available: false }, 10_000, 1_000) === 'alone');
+  check('guard abstains when presence was never reported',
+    guard.evaluate({ available: true, lastRemoteAudioAt: 0 }, 10_000, 1_000) === 'alone');
+  check('guard abstains on a stale presence report',
+    guard.evaluate({ ...base, streamsObservedAt: 8_000, streamsPresentAt: 8_000 }, 10_000, 1_000) === 'alone');
+  check('guard abstains while frames are arriving',
+    guard.evaluate({ ...base, lastRemoteFrameAt: 9_500 }, 10_000, 1_000) === 'alone');
+  check('guard objects when connected streams deliver nothing',
+    guard.evaluate(base, 10_000, 1_000) === 'capture-fault');
+  check('guard objects when frames stopped a full window ago',
+    guard.evaluate({ ...base, lastRemoteFrameAt: 8_000 }, 10_000, 1_000) === 'capture-fault');
+  check('the shipped guard defaults to a 30s presence staleness',
+    deafCaptureGuardAdapter.evaluate({ ...base, streamsObservedAt: 10_000 - DEFAULT_STREAM_PRESENCE_STALENESS_MS - 1, streamsPresentAt: 0 }, 10_000, 1_000) === 'alone'
+    && DEFAULT_STREAM_PRESENCE_STALENESS_MS === 30_000);
+}
+
+// The tap's two clocks: arrival (capture liveness) and presence (someone spoke) move independently.
+{
+  const clock = new FakeClock();
+  const tap = createRemoteAudioActivityTap({ now: clock.now });
+  tap.ready();
+  clock.advance(100);
+  tap.observeRemoteEnergy(0);
+  check('a zero-energy frame counts as arrival, not presence',
+    tap.snapshot().lastRemoteFrameAt === 100 && tap.snapshot().lastRemoteAudioAt === 0 && tap.snapshot().framesDelivered === 1);
+  clock.advance(100);
+  tap.observeRemoteEnergy(loudEnergy);
+  check('an energetic frame moves both', tap.snapshot().lastRemoteFrameAt === 200 && tap.snapshot().lastRemoteAudioAt === 200);
+  clock.advance(100);
+  tap.observeStreamPresence(3);
+  check('presence records count, observation time and last-present time',
+    tap.snapshot().streamsConnected === 3 && tap.snapshot().streamsObservedAt === 300 && tap.snapshot().streamsPresentAt === 300);
+  clock.advance(100);
+  tap.observeStreamPresence(0);
+  check('a zero report updates the observation time but keeps the last-present time',
+    tap.snapshot().streamsConnected === 0 && tap.snapshot().streamsObservedAt === 400 && tap.snapshot().streamsPresentAt === 300);
+  tap.observeStreamPresence(Number.NaN);
+  check('a nonsense presence report is ignored', tap.snapshot().streamsObservedAt === 400);
+  tap.unavailable();
+  check('unavailable still fails closed', tap.snapshot().available === false && tap.snapshot().lastRemoteAudioAt === undefined);
+  tap.ready();
+  check('a capture restart re-arms frame bookkeeping but keeps what the page said about the room',
+    tap.snapshot().framesDelivered === 0 && tap.snapshot().lastRemoteFrameAt === undefined
+    && tap.snapshot().streamsConnected === 0 && tap.snapshot().streamsPresentAt === 300);
 }
 
 // Timeout precedence: explicit invocation > valid env > 10-minute module default.
