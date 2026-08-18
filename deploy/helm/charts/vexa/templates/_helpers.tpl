@@ -117,6 +117,17 @@ vexaai/vexa-bot:v012
 {{- end -}}
 {{- end -}}
 
+{{/* Render a component image as a digest when one is supplied, otherwise retain the chart's tag behavior. */}}
+{{- define "vexa.imageRef" -}}
+{{- $image := index . 0 -}}
+{{- $tag := index . 1 -}}
+{{- if $image.digest -}}
+{{- printf "%s@%s" $image.repository $image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
 {{/* The agent-worker image ref (AGENT_WORKER_IMAGE; the dedicated worker build — core/agent/worker/Dockerfile — NOT the agent-api image). */}}
 {{- define "vexa.agentWorkerImage" -}}
 {{- if .Values.global.imageTag -}}
