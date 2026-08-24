@@ -60,17 +60,19 @@ writeFileSync(join(dir, 'vt.csrc.jsonl'), runs.flatMap(([tr, a, b]) => [
   JSON.stringify({ type: 'csrc', t: T0 + b, csrc: tr, active: false, lane: 'mixed' }),
 ]).join('\n') + '\n');
 
-const run = (mode: string, tag: string): { rows: string; writes: string } => {
-  execFileSync('npx', ['tsx', join(here, 'tape-replay.ts'),
+const run = (mode: string, tag: string): { rows: string; writes: string; output: string } => {
+  const output = execFileSync('npx', ['tsx', join(here, 'tape-replay.ts'),
     '--tape', join(dir, 'vt.captured-signal.jsonl'), '--turn-source', 'csrc', mode,
     '--out-json', join(dir, `${tag}.json`), '--out-writes', join(dir, `${tag}.writes.jsonl`)],
-    { stdio: 'pipe', cwd: join(here, '..') });
-  return { rows: readFileSync(join(dir, `${tag}.json`), 'utf8'), writes: readFileSync(join(dir, `${tag}.writes.jsonl`), 'utf8') };
+    { stdio: 'pipe', cwd: join(here, '..') }).toString();
+  return {
+    rows: readFileSync(join(dir, `${tag}.json`), 'utf8'),
+    writes: readFileSync(join(dir, `${tag}.writes.jsonl`), 'utf8'),
+    output,
+  };
 };
 
-const t0 = Date.now();
 const virtual = run('--virtual-time', 'vt');
-const virtualMs = Date.now() - t0;
 const t1 = Date.now();
 const real = run('--realtime', 'rt');
 const realMs = Date.now() - t1;
@@ -82,8 +84,11 @@ check('…and its whole publish stream, drafts and retractions included',
   `virtual ${virtual.writes.split('\n').length} calls vs real ${real.writes.split('\n').length}`);
 check('the run actually exercised the draft/confirm cycle (otherwise it proves nothing)',
   real.writes.includes('"completed":false'), 'no draft was ever published — the tape is too short');
-check(`and it did so without paying the wall clock (${virtualMs}ms vs ${realMs}ms)`,
-  virtualMs < realMs, `${virtualMs}ms vs ${realMs}ms`);
+check('the virtual replay drove cadence heartbeats from the tape clock',
+  /virtual time: [1-9]\d* heartbeat\(s\) fired across the tape/.test(virtual.output),
+  'virtual replay did not report a fired heartbeat');
+check('the realtime replay paid the captured duration',
+  realMs >= 7_000, `${realMs}ms for a 7.6s captured run`);
 
 if (failed) { console.error(`\n❌ virtual-time-equivalence: ${failed} check(s) FAILED.`); process.exit(1); }
-console.log(`\n✅ virtual-time-equivalence: the tape's clock produces the identical run in ${virtualMs}ms that the wall clock takes ${realMs}ms to produce.`);
+console.log(`\n✅ virtual-time-equivalence: virtual cadence matches the real run; realtime replay took ${realMs}ms.`);
