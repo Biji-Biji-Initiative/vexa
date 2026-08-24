@@ -187,15 +187,26 @@ else
 fi
 
 # #900 — the migrations Job must follow global.imageTag (it runs release code against the
-# schema; a rolling-v012 image on a pinned deploy is a schema/code skew). Opposite of the
-# dashboard: here global.imageTag MUST win over the meetingApi/migrations fallback tag.
+# schema; a rolling-v012 image on a pinned deploy is a schema/code skew). The durable schema
+# belongs to admin-api, so this Job must execute the admin-api image and runner, never a retired
+# meeting-api import. Opposite of the dashboard: here global.imageTag MUST win over the component
+# fallback tag.
 MIG_IMG="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
   --set migrations.enabled=true --set global.imageTag=vMIGRATE \
   --show-only templates/job-migrations.yaml | grep -E '^\s+image:')"
-if grep -qE ':vMIGRATE"?$' <<< "$MIG_IMG"; then
-  echo "  OK: migrations Job honors global.imageTag (pinned release image)"
+MIG_RENDER="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set migrations.enabled=true --set global.imageTag=vMIGRATE \
+  --show-only templates/job-migrations.yaml)"
+MIG_OWNER_RENDER="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set migrations.enabled=true --set global.imageTag= \
+  --set adminApi.image.repository=example.invalid/schema-owner --set adminApi.image.tag=vOWNER \
+  --show-only templates/job-migrations.yaml)"
+if grep -qE 'image: "vexaai/v012-admin-api:vMIGRATE"' <<< "$MIG_IMG" \
+  && grep -q 'python -m admin_api.schema_runner' <<< "$MIG_RENDER" \
+  && grep -qE 'image: "example.invalid/schema-owner:vOWNER"' <<< "$MIG_OWNER_RENDER"; then
+  echo "  OK: migrations Job uses the pinned admin-api schema runner"
 else
-  echo "  FAIL: migrations Job ignored global.imageTag — schema/code skew risk (#900): $MIG_IMG"; fail=1
+  echo "  FAIL: migrations Job must use the pinned admin-api schema runner (#900): $MIG_IMG"; fail=1
 fi
 
 [ "$fail" -eq 0 ] && { echo "gate:helm PASS"; exit 0; } || { echo "gate:helm FAIL"; exit 1; }

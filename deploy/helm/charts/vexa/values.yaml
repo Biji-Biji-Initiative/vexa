@@ -330,14 +330,11 @@ dashboard:
     limits:   { cpu: 500m, memory: 1Gi }
   extraEnv: []
 
-# Optional idempotent schema-sync Job (meeting-api owns init_db). Off by default; the services
-# create their schema on boot. Enable for an explicit pre-upgrade migration gate.
+# Optional idempotent schema-sync Job (admin-api owns the durable schema). Off by default; the
+# services create their schema on boot. Enable for an explicit pre-upgrade migration gate.
 migrations:
   enabled: false
   backoffLimit: 3
-  image:
-    repository: ""
-    tag: ""
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
