@@ -133,7 +133,9 @@ def _stack_env() -> dict:
         "ADMIN_TOKEN": ADMIN_TOKEN,
         "INTERNAL_API_SECRET": INTERNAL_API_SECRET,
         "MINIO_BUCKET": MINIO_BUCKET,
-        "BROWSER_IMAGE": os.getenv("BROWSER_IMAGE", "vexaai/vexa-bot:v012"),
+        # Routine control-plane readiness uses the source-built worker; the browser bot is an
+        # explicit COMPOSE_BOT lane.
+        "BROWSER_IMAGE": os.getenv("BROWSER_IMAGE", "mock-bot:dev"),
         "API_GATEWAY_HOST_PORT": GATEWAY_PORT,
         "ADMIN_API_PORT": ADMIN_API_HOST_PORT,
         "MEETING_API_PORT": MEETING_API_HOST_PORT,
