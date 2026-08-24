@@ -1,8 +1,8 @@
 """Validate runtime in ISOLATION against the REAL docker substrate — spawn an actual container, drive
 it through the runtime.v1 lifecycle, and assert it genuinely ran, stopped, and was removed. Skipped
 where the docker daemon is unavailable (e.g. CI without Docker)."""
-import shutil
 import os
+import shutil
 import subprocess
 import uuid
 
@@ -16,17 +16,27 @@ from runtime_kernel.profiles import Runnable
 
 def _docker_ok() -> bool:
     return bool(shutil.which("docker")) and subprocess.run(
-        ["docker", "info"], capture_output=True
+        ["docker", "info"], check=False, capture_output=True, timeout=10
     ).returncode == 0
 
 
 pytestmark = pytest.mark.skipif(not _docker_ok(), reason="docker daemon not available")
 
+TEST_IMAGE = "alpine"
+
+
+def _ensure_test_image() -> None:
+    if subprocess.run(
+        ["docker", "image", "inspect", TEST_IMAGE], check=False, capture_output=True, timeout=10
+    ).returncode == 0:
+        return
+    subprocess.run(["docker", "pull", TEST_IMAGE], check=True, capture_output=True, timeout=600)
+
 
 def _exists(name: str) -> bool:
     out = subprocess.run(
         ["docker", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
-        capture_output=True, text=True,
+        check=False, capture_output=True, text=True, timeout=10,
     ).stdout
     return name in out.split()
 
@@ -38,10 +48,13 @@ def test_docker_backend_real_container_lifecycle():
     # in progress", accusing whatever diff happened to be under test. (#864)
     wid = f"rt-dockertest-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     name = f"vexa-{wid}"
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)  # clean slate
+    _ensure_test_image()
+    subprocess.run(
+        ["docker", "rm", "-f", name], check=False, capture_output=True, timeout=10
+    )  # clean slate
     rt = Runtime(
         backend=DockerBackend(),
-        profiles={"test": Runnable(image="alpine", command=["sleep", "30"])},
+        profiles={"test": Runnable(image=TEST_IMAGE, command=["sleep", "30"])},
         grace_sec=10.0,
     )
     spec = WorkloadSpec(workloadId=wid, profile="test", env={"VEXA_X": "y"})
@@ -57,4 +70,6 @@ def test_docker_backend_real_container_lifecycle():
         assert rt.get(wid).state is RuntimeState.destroyed
         assert not _exists(name)                              # container actually removed
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(
+            ["docker", "rm", "-f", name], check=False, capture_output=True, timeout=10
+        )
