@@ -35,6 +35,15 @@ helm install vexa deploy/helm/charts/vexa -f deploy/helm/charts/vexa/values.yaml
 `values-staging.yaml` and `values-test.yaml` show environment overlays. Chart tests
 (`helm lint` + template tests) live under `deploy/helm/tests/`.
 
+### Explicit schema convergence
+
+`migrations.enabled` is off by default because admin-api converges its durable schema during
+normal startup. Enable the Job only when an explicit pre-rollout convergence gate is required.
+The Job always runs the **admin-api image** at the same `global.imageTag` as the release and invokes
+`python -m admin_api.schema_runner`; it does not accept a separate migration image. The runner uses
+the same idempotent, additive schema authority as admin-api startup, holds one DB connection, and
+releases it before the Job exits.
+
 ### Is this install actually working? — `make probe SURFACE=helm`
 
 The standing full-journey smoke probe drives spawn → schedule → boot → join → transcribe →
