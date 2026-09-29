@@ -396,6 +396,36 @@ class SqlAlchemyMeetingRepo:
                 out[mid] = (sid, bcid)
         return [(mid, sid, bcid) for mid, (sid, bcid) in out.items()]
 
+    async def list_stale_sessionless_requested(self, *, older_than_seconds: float) -> list[int]:
+        """`requested` meetings with NO MeetingSession and NO workload, quiet past the window — a
+        spawn interrupted between the row insert and the session insert. ``list_stale_nonterminal``
+        joins MeetingSession and so can never list them (see
+        ``reconcile.reconcile_sessionless_preactive_sweep``)."""
+        from datetime import datetime, timezone
+
+        from sqlalchemy import exists, select
+
+        from ..sessions.models import Meeting, MeetingSession
+
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(Meeting.id, Meeting.updated_at)
+                    .where(Meeting.status == "requested")
+                    .where(Meeting.bot_container_id.is_(None))
+                    .where(~exists().where(MeetingSession.meeting_id == Meeting.id))
+                )
+            ).all()
+        now = datetime.now(timezone.utc)
+        out: list[int] = []
+        for mid, upd in rows:
+            if upd is None:
+                continue
+            u = upd if upd.tzinfo else upd.replace(tzinfo=timezone.utc)
+            if (now - u).total_seconds() >= older_than_seconds:
+                out.append(mid)
+        return out
+
     async def list_stale_nonterminal(
         self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None
     ) -> list[tuple[int, str, str, Optional[str], bool]]:

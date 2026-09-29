@@ -450,6 +450,7 @@ def _attach_background_loops(
             return
         from .lifecycle.machine import TransitionSource as _TS
         from .lifecycle.reconcile import (
+            reconcile_sessionless_preactive_sweep,
             reconcile_stale_nonterminal_sweep,
             reconcile_stale_stopping_sweep,
         )
@@ -484,6 +485,9 @@ def _attach_background_loops(
                 )
             await reconcile_stale_stopping_sweep(
                 meeting_repo, runtime, _post_lifecycle, stop_grace=stop_grace, log=log,
+            )
+            await reconcile_sessionless_preactive_sweep(
+                meeting_repo, preactive_grace=preactive_grace, log=log,
             )
 
         while True:

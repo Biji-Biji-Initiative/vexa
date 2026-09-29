@@ -453,6 +453,44 @@ async def reconcile_stale_nonterminal_sweep(
     return reconciled
 
 
+# A spawn interrupted between the meeting-row insert and the MeetingSession insert (the process
+# died, or the runtime call raised something other than SpawnFailed/QuotaExceeded) leaves a
+# `requested` row with NO session and NO workload. ``list_stale_nonterminal`` joins MeetingSession,
+# so the general sweep never sees it, no DELETE /bots can reach it (the stop marks rows through
+# their session), and it counts against the user's concurrent-bot cap FOREVER (Biji dev,
+# 2026-09-29: one such row at max_concurrent_bots=1 429'd every start). There is no bot to probe
+# and no connection_id to post a lifecycle event for, so it is failed BY ID, as the spawn's own
+# failure path does (``fail_meeting``), once it is older than the pre-active grace.
+_SESSIONLESS_REASON = (
+    "spawn interrupted: no bot session or workload was ever recorded for this start"
+)
+
+
+async def reconcile_sessionless_preactive_sweep(
+    repo: Any, *, preactive_grace: float, log: Any
+) -> int:
+    """Fail stale session-less, workload-less `requested` rows by id. Best-effort; never raises."""
+    if repo is None or not hasattr(repo, "list_stale_sessionless_requested"):
+        return 0
+    try:
+        stale = await repo.list_stale_sessionless_requested(older_than_seconds=preactive_grace)
+    except Exception:
+        log.exception("sessionless-reconcile: list_stale_sessionless_requested failed")
+        return 0
+    reconciled = 0
+    for meeting_id in stale:
+        try:
+            await repo.fail_meeting(
+                meeting_id=meeting_id, reason=_SESSIONLESS_REASON, failure_stage="requested"
+            )
+            reconciled += 1
+            log.warning("sessionless-reconcile: failed stale requested meeting %s (%s)",
+                        meeting_id, _SESSIONLESS_REASON)
+        except Exception:
+            log.exception("sessionless-reconcile: fail_meeting(%s) failed", meeting_id)
+    return reconciled
+
+
 def _log_orphan_kill_failed(meeting_id, workload_id, err, *, unconfirmed: bool = False) -> None:
     try:
         from ..obs import log_event
