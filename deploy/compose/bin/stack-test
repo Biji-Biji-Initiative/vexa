@@ -18,4 +18,9 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 cd "$TESTS"
+if [ "${BROWSER_IMAGE:-mock-bot:dev}" = "mock-bot:dev" ] \
+  && ! docker image inspect mock-bot:dev >/dev/null 2>&1; then
+  repo_root="$(cd "$HERE/../../.." && pwd)"
+  docker build -f "$repo_root/core/meetings/services/bot/Dockerfile.mock" -t mock-bot:dev "$repo_root"
+fi
 exec uv run --quiet pytest -q "$@"
