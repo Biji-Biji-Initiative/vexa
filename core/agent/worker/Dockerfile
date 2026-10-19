@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Claude Code (the unit's model+tooling runtime) + git (the governance git ops). node 20 via nodesource
 # so claude-code resolves; the subscription credentials are bind-mounted read-only at runtime (P15).
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     npm install -g @anthropic-ai/claude-code && \
     apt-get purge -y curl gnupg && apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
